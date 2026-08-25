@@ -81,6 +81,16 @@ jobs:
             throw "v143 (14.3x/14.4x) toolset missing -- CPython 3.12 cannot be built on this image"
           }
 
+          # v143 具体映射到哪个 14.x，由这个 props 决定。镜像上同时存在 v142(14.29) 与
+          # VS2026 的 14.5x 时，光看"有没有 14.3x/14.4x 目录"是判断不出实际用了哪个的。
+          $v143Props = Join-Path $inst 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.v143.default.props'
+          if (Test-Path $v143Props) {
+            $m = Select-String -Path $v143Props -Pattern '<VCToolsVersion[^>]*>([\d\.]+)<' | Select-Object -First 1
+            if ($m) { Write-Host "v143 resolves: MSVC $($m.Matches[0].Groups[1].Value)" }
+          } else {
+            Write-Host "::warning::没找到 $v143Props —— /p:PlatformToolset=v143 可能落不到预期工具集，以 Verify 步骤的 MSC 版本为准"
+          }
+
           $msbuild = Join-Path $inst 'MSBuild\Current\Bin\amd64\MSBuild.exe'
           if (-not (Test-Path $msbuild)) { $msbuild = Join-Path $inst 'MSBuild\Current\Bin\MSBuild.exe' }
           if (-not (Test-Path $msbuild)) { throw "MSBuild.exe not found under $inst" }
@@ -88,6 +98,7 @@ jobs:
 
           Add-Content $env:GITHUB_ENV "MSBUILD=$msbuild"
           Add-Content $env:GITHUB_ENV "PY_TOOLSET=v143"
+          Add-Content $env:GITHUB_ENV "VSINSTALL=$inst"
 
       - name: Build with MSVC (PGO)
         shell: cmd
@@ -112,17 +123,49 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $py = "_out\python-${{ env.PY_VER }}-win64\python.exe"
-          Write-Host "=== 版本与编译器（MSC v.19xx 可确认工具集）==="
-          & $py -VV
+          $out = "_out\python-${{ env.PY_VER }}-win64"
+          $py  = "$out\python.exe"
+
+          Write-Host "=== 版本与编译器 ==="
+          $vv = (& $py -VV) -join ' '
+          Write-Host $vv
+          # 工具集硬闸门。MSC v.19XX 与 MSVC 14.XX 一一对应（14.44 -> MSC v.1944），
+          # 这是唯一能证明 /p:PlatformToolset=v143 真的生效的证据：
+          # 镜像上同时装着 v142(14.29) 和 VS2026 的 14.5x，只看目录存在与否查不出来。
+          if ($vv -notmatch 'MSC v\.(\d{4})') { throw "无法从 -VV 解析 MSC 版本：$vv" }
+          $msc = [int]$Matches[1]
+          Write-Host "MSC v.$msc  =>  MSVC 14.$($msc - 1900)"
+          if ($msc -lt 1930) {
+            throw "工具集回退到了 v142 或更早（MSC v.$msc）—— /p:PlatformToolset=v143 没生效"
+          }
+          if ($msc -gt 1949) {
+            Write-Host "::warning::用的不是 v143 家族（MSC v.$msc，疑似 VS2026 工具集），请确认下面 vcruntime 的版本与之匹配"
+          }
+
+          Write-Host "=== 绿色包必须自带 VC 运行时 ==="
+          # 注意：runner 自己装了 VC++ 运行库，System32 里有 vcruntime140.dll，
+          # 所以"python.exe 能跑"并不能证明产物自包含 —— 必须直接查文件在不在。
+          $vcr = @(Get-ChildItem "$out\vcruntime*.dll" -ErrorAction SilentlyContinue)
+          if ($vcr.Count -eq 0) {
+            Write-Host "::warning::layout 没带上 vcruntime140.dll，正在从所选工具集的 redist 补齐"
+            $src = @(Get-ChildItem "$env:VSINSTALL\VC\Redist\MSVC\*\x64\Microsoft.VC143.CRT\vcruntime140*.dll" -ErrorAction SilentlyContinue |
+                     Sort-Object FullName | Select-Object -Last 2)
+            if ($src.Count -eq 0) { throw "找不到 vcruntime140.dll，产物无法自包含（目标机没装 VC++ 运行库就起不来）" }
+            $src | ForEach-Object { Copy-Item $_.FullName $out -Force; Write-Host "copied: $($_.FullName)" }
+            $vcr = @(Get-ChildItem "$out\vcruntime*.dll")
+          }
+          $vcr | ForEach-Object { Write-Host ("  {0}  {1}" -f $_.Name, $_.VersionInfo.FileVersion) }
+
           Write-Host "=== 必需模块（任一失败即构建失败）==="
           & $py -c "import ssl, lzma, sqlite3, ctypes, zlib, bz2, hashlib, decimal, socket, uuid; print('OK', ssl.OPENSSL_VERSION)"
           if ($LASTEXITCODE -ne 0) { throw "必需模块自检失败" }
 
           Write-Host "=== 开发件（Nuitka/cffi 需要）==="
-          $lib = "_out\python-${{ env.PY_VER }}-win64\libs\python$($env:PY_VER.Split('.')[0])$($env:PY_VER.Split('.')[1]).lib"
-          if (-not (Test-Path $lib)) { throw "缺少 $lib —— layout 没带上 dev 文件，Nuitka 无法链接" }
-          if (-not (Test-Path "_out\python-${{ env.PY_VER }}-win64\include\Python.h")) { throw "缺少 include/Python.h" }
+          $mm  = $env:PY_VER.Split('.')[0] + $env:PY_VER.Split('.')[1]
+          $lib = "$out\libs\python$mm.lib"
+          if (-not (Test-Path $lib))               { throw "缺少 $lib —— layout 没带上 dev 文件，Nuitka 无法链接" }
+          if (-not (Test-Path "$out\include\Python.h")) { throw "缺少 include/Python.h" }
+          if (-not (Test-Path "$out\python$mm.dll"))   { throw "缺少 python$mm.dll" }
 
           Write-Host "=== 可选件（只报告，不拦截）==="
           & $py -c "import pip; print('pip', pip.__version__)"
