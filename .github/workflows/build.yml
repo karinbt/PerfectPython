@@ -454,13 +454,28 @@ jobs:
           "$VPY" -m nuitka --standalone --lto=yes \
             --assume-yes-for-downloads --output-dir=probe-out probe.py
 
-          echo "=== 链接形态：必须是动态 libpython ==="
-          otool -L probe-out/probe.dist/probe
-          otool -L probe-out/probe.dist/probe | grep -q "libpython$PYMM" || {
-            echo "::error::Nuitka 静态链接了 libpython —— 产物里一定还残留着 libpython$PYMM.a"; exit 1; }
-          test -e "probe-out/probe.dist/libpython$PYMM.dylib"
+          DIST=probe-out/probe.dist
+          echo "=== dist 目录内容 ==="
+          ls -la "$DIST"
 
-          ./probe-out/probe.dist/probe
+          # 别写死产物名：Nuitka 在 POSIX 上给 standalone 二进制加 .bin 后缀，
+          # 而这条规则在各版本间反复改过（onefile / app-bundle 分支各不相同）。
+          BIN=
+          for c in "$DIST/probe.bin" "$DIST/probe"; do
+            if [ -f "$c" ]; then BIN="$c"; break; fi
+          done
+          [ -n "$BIN" ] || { echo "::error::没找到 Nuitka standalone 产物，见上方目录列表"; exit 1; }
+          echo "binary: $BIN"
+
+          echo "=== 链接形态：必须是动态 libpython ==="
+          otool -L "$BIN"
+          otool -L "$BIN" | grep -q "libpython$PYMM" || {
+            echo "::error::Nuitka 静态链接了 libpython —— 产物里一定还残留着 libpython$PYMM.a"; exit 1; }
+          if ! ls "$DIST"/libpython"$PYMM"*.dylib >/dev/null 2>&1; then
+            echo "::error::dist 里没有 libpython$PYMM*.dylib，Nuitka 没把解释器动态库带进来"; exit 1
+          fi
+
+          "$BIN"
 
       - name: Package tar.gz
         run: |
